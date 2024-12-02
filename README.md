@@ -28,7 +28,7 @@ Honostr is a Nostr relay that leverages the performance and scalability of Cloud
 1. **Clone the Repository**
 
    ```bash
-   git clone https://github.com/yourusername/honostr.git
+   git clone https://github.com/afxal/honostr.git
    cd honostr
 
    ```
