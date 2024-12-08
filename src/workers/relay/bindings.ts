@@ -25,3 +25,40 @@ export type Filters = {
   limit?: number;
   [key: string]: any;
 };
+
+export interface RelayConfig {
+  relayInfo: {
+    name: string;
+    description: string;
+    pubkey: string;
+    contact: string;
+    supported_nips: number[];
+    software: string;
+    version: string;
+  };
+  relayIcon: string;
+  nip05Users: Record<string, string>;
+  helpers: {
+    event: string[];
+    req: string[];
+  };
+  pubkeys: {
+    blocked: string[];
+    allowed: string[];
+  };
+  eventKinds: {
+    blocked: number[];
+    allowed: number[];
+  };
+  content: {
+    blocked: string[];
+  };
+  nip05Domains: {
+    blocked: string[];
+    allowed: string[];
+  };
+  tags: {
+    blocked: string[];
+    allowed: string[];
+  };
+}

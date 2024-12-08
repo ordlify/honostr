@@ -157,7 +157,13 @@ async function withConnectionLimit<T>(
   }
 }
 
-const wsMap = new Map<string, WSContext<WebSocket>>();
+const subscriptions = new Map<
+  string,
+  {
+    ws: WSContext<WebSocket>;
+    filters: Map<string, Filters>;
+  }
+>();
 
 // Hono route handlers
 
@@ -241,17 +247,43 @@ async function handleNIP05Request(c: Context) {
 // Function to handle WebSocket connections
 function handleWebSocket(c: Context<{ Bindings: Bindings }>) {
   const env = c.env;
-  const wsId = Math.random().toString(36).substring(2, 11);
+  const wsId = crypto.randomUUID();
+  let initialized = false;
+
+  console.log(`[WS] Generated new wsId: ${wsId}`);
 
   return {
     onOpen(ws: WSContext<WebSocket>) {
-      (ws as any).id = wsId; // Assign wsId to ws
-      wsMap.set(wsId, ws); // Store ws in wsMap
+      try {
+        // Store the connection
+        subscriptions.set(wsId, {
+          ws,
+          filters: new Map(),
+        });
+        initialized = true;
+
+        console.log(`[WS] Connection opened for wsId: ${wsId}`);
+        console.log(`[WS] Active connections: ${subscriptions.size}`);
+
+        // Send a welcome message to verify connection
+        ws.send(JSON.stringify(["NOTICE", "Welcome to Nostr relay"]));
+      } catch (error) {
+        console.error(`[WS] Error in onOpen for wsId ${wsId}:`, error);
+      }
     },
     onMessage(evt: MessageEvent, ws: WSContext<WebSocket>): void {
       (async () => {
         try {
-          // Parse the message
+          // If connection hasn't been initialized yet, do it now
+          if (!initialized) {
+            subscriptions.set(wsId, {
+              ws,
+              filters: new Map(),
+            });
+            initialized = true;
+            console.log(`[WS] Late initialization for wsId: ${wsId}`);
+          }
+
           let messageData: any;
           if (evt.data instanceof ArrayBuffer) {
             const textDecoder = new TextDecoder("utf-8");
@@ -262,7 +294,7 @@ function handleWebSocket(c: Context<{ Bindings: Bindings }>) {
           }
 
           const messageType = messageData[0];
-          const wsId = (ws as any).id;
+          console.log(`[WS] Received ${messageType} message for wsId: ${wsId}`);
 
           switch (messageType) {
             case "EVENT":
@@ -274,33 +306,27 @@ function handleWebSocket(c: Context<{ Bindings: Bindings }>) {
             case "CLOSE":
               await closeSubscription(messageData[1], wsId);
               break;
-            // Add more cases as needed
           }
         } catch (e) {
-          sendError((ws as any).id, "Failed to process the message");
-          console.error("Failed to process message:", e);
+          console.error(`[WS] Error processing message for wsId ${wsId}:`, e);
+          sendError(wsId, "Failed to process the message");
         }
       })();
     },
-    onClose(evt: CloseEvent, ws: WSContext<WebSocket>): void {
-      const wsId = (ws as any).id;
-      relayCache.clearSubscriptions(wsId);
-      wsMap.delete(wsId);
-      console.log("WebSocket closed");
+    onClose(evt: CloseEvent, ws: WSContext<WebSocket>) {
+      console.log(`[WS] Closing connection for wsId: ${wsId}`);
+      subscriptions.delete(wsId);
+      console.log(`[WS] Remaining connections: ${subscriptions.size}`);
     },
-    onError(evt: Event, ws: WSContext<WebSocket>): void {
-      console.error("WebSocket error:", evt);
+    onError(evt: Event, ws: WSContext<WebSocket>) {
+      console.error(`[WS] Error for wsId ${wsId}:`, evt);
+      subscriptions.delete(wsId);
     },
   };
 }
 
 // Process EVENT messages
 async function processEvent(event: NostrEvent, wsId: string, env: Bindings) {
-  const ws = wsMap.get(wsId);
-  if (!ws) {
-    console.error(`[Event] WebSocket not found for wsId: ${wsId}`);
-    return;
-  }
   try {
     if (typeof event !== "object" || event === null || Array.isArray(event)) {
       console.error(
@@ -369,8 +395,8 @@ async function processEventInBackground(
   wsId: string,
   env: Bindings
 ) {
-  const ws = wsMap.get(wsId);
-  if (!ws) {
+  const connection = subscriptions.get(wsId);
+  if (!connection) {
     console.error(`[Event] WebSocket not found for wsId: ${wsId}`);
     return;
   }
@@ -461,7 +487,7 @@ async function processEventInBackground(
           console.log(
             `[Event] Event ${event.id} matched subscription ${subscriptionId}`
           );
-          ws.send(JSON.stringify(["EVENT", subscriptionId, event]));
+          connection.ws.send(JSON.stringify(["EVENT", subscriptionId, event]));
         }
       }
       if (!matched) {
@@ -507,8 +533,8 @@ async function processReq(message: any, wsId: string, env: Bindings) {
   const subscriptionId = message[1];
   const filters: Filters = message[2] || {};
 
-  const ws = wsMap.get(wsId);
-  if (!ws) {
+  const connection = subscriptions.get(wsId);
+  if (!connection) {
     console.error(`[REQ] WebSocket not found for wsId: ${wsId}`);
     return;
   }
@@ -629,7 +655,7 @@ async function processReq(message: any, wsId: string, env: Bindings) {
   if (cachedEvents && cachedEvents.length > 0) {
     console.log(`Serving cached events for subscriptionId: ${subscriptionId}`);
     for (const event of cachedEvents.slice(0, filters.limit)) {
-      ws.send(JSON.stringify(["EVENT", subscriptionId, event]));
+      connection.ws.send(JSON.stringify(["EVENT", subscriptionId, event]));
     }
     sendEOSE(wsId, subscriptionId);
     return;
@@ -658,7 +684,7 @@ async function processReq(message: any, wsId: string, env: Bindings) {
 
     // Send the events to the client after all helpers have completed
     for (const event of events.slice(0, filters.limit)) {
-      ws.send(JSON.stringify(["EVENT", subscriptionId, event]));
+      connection.ws.send(JSON.stringify(["EVENT", subscriptionId, event]));
     }
     sendEOSE(wsId, subscriptionId);
   } catch (error: unknown) {
@@ -1147,9 +1173,9 @@ function sendOK(
   status: boolean,
   message: string
 ) {
-  const ws = wsMap.get(wsId);
-  if (ws) {
-    ws.send(JSON.stringify(["OK", eventId, status, message]));
+  const connection = subscriptions.get(wsId);
+  if (connection) {
+    connection.ws.send(JSON.stringify(["OK", eventId, status, message]));
   } else {
     console.error(`WebSocket not found for wsId: ${wsId}`);
   }
@@ -1157,9 +1183,9 @@ function sendOK(
 
 // sendError
 function sendError(wsId: string, message: string) {
-  const ws = wsMap.get(wsId);
-  if (ws) {
-    ws.send(JSON.stringify(["NOTICE", message]));
+  const connection = subscriptions.get(wsId);
+  if (connection) {
+    connection.ws.send(JSON.stringify(["NOTICE", message]));
   } else {
     console.error(`WebSocket not found for wsId: ${wsId}`);
   }
@@ -1167,9 +1193,9 @@ function sendError(wsId: string, message: string) {
 
 // sendEOSE
 function sendEOSE(wsId: string, subscriptionId: string) {
-  const ws = wsMap.get(wsId);
-  if (ws) {
-    ws.send(JSON.stringify(["EOSE", subscriptionId]));
+  const connection = subscriptions.get(wsId);
+  if (connection) {
+    connection.ws.send(JSON.stringify(["EOSE", subscriptionId]));
   } else {
     console.error(`WebSocket not found for wsId: ${wsId}`);
   }

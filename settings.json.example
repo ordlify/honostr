@@ -1,0 +1,41 @@
+{
+  "relayInfo": {
+    "name": "Honostr",
+    "description": "Honostr is a Nostr relay built on Cloudflare Workers and R2 (fork of Nosflare)",
+    "pubkey": "42d88cad5c336570e9ccfb8897781e09898110b048cb445787a6124a8540527d",
+    "contact": "iam@apo.mv",
+    "supported_nips": [1, 2, 4, 5, 9, 11, 12, 15, 16, 17, 20, 22, 33, 40],
+    "software": "https://github.com/afxal/honostr",
+    "version": "1.0.0"
+  },
+  "relayIcon": "https://ordrion.ordlify.com/icons/honostr.png",
+  "nip05Users": {
+    "apo": "42d88cad5c336570e9ccfb8897781e09898110b048cb445787a6124a8540527d"
+  },
+  "helpers": {
+    "event": ["https://your_event_helper_url"],
+    "req": ["https://your_req_helper_url"]
+  },
+  "pubkeys": {
+    "blocked": [
+      "3c7f5948b5d80900046a67d8e3bf4971d6cba013abece1dd542eca223cf3dd3f",
+      "fed5c0c3c8fe8f51629a0b39951acdf040fd40f53a327ae79ee69991176ba058"
+    ],
+    "allowed": []
+  },
+  "eventKinds": {
+    "blocked": [1064],
+    "allowed": []
+  },
+  "content": {
+    "blocked": ["~~ hello world! ~~"]
+  },
+  "nip05Domains": {
+    "blocked": [],
+    "allowed": []
+  },
+  "tags": {
+    "blocked": [],
+    "allowed": []
+  }
+}
