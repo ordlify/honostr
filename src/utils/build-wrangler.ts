@@ -12,6 +12,8 @@ interface EnvVars {
   ACCOUNT_ID: string;
   R2_BUCKET_NAME: string;
   COMPATIBILITY_DATE: string;
+  AUTH_SECRET?: string;
+  ENABLE_LOGGING?: string;
 }
 
 const requiredEnvVars: (keyof EnvVars)[] = [
@@ -22,6 +24,7 @@ const requiredEnvVars: (keyof EnvVars)[] = [
   "ACCOUNT_ID",
   "R2_BUCKET_NAME",
   "COMPATIBILITY_DATE",
+  "AUTH_SECRET",
 ];
 
 const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
@@ -39,6 +42,8 @@ const {
   ACCOUNT_ID,
   R2_BUCKET_NAME,
   COMPATIBILITY_DATE,
+  AUTH_SECRET,
+  ENABLE_LOGGING,
 } = process.env as unknown as EnvVars;
 
 const workers = ["relay", "req", "event"];
@@ -56,11 +61,16 @@ account_id = "${ACCOUNT_ID}"
     R2_BUCKET_DOMAIN,
     API_TOKEN,
     ZONE_ID,
+    AUTH_SECRET,
   };
 
   if (worker === "req") {
     vars.API_TOKEN = "";
     vars.ZONE_ID = "";
+  }
+
+  if (AUTH_SECRET) {
+    vars = { ...vars, AUTH_SECRET };
   }
 
   const varsEntries = Object.entries(vars)
@@ -78,11 +88,20 @@ binding = "relayDb"
 bucket_name = "${R2_BUCKET_NAME}"
 `;
 
+  const loggingConfig = ENABLE_LOGGING
+    ? `
+[observability.logs]
+enabled = true
+`
+    : "";
+
   const finalConfig = `${config.trim()}
 
 ${varsSection.trim()}
 
 ${r2BucketConfig.trim()}
+
+${loggingConfig.trim()}
 `;
 
   fs.writeFileSync(

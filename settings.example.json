@@ -3,6 +3,7 @@
     "name": "Honostr",
     "description": "Honostr is a Nostr relay built on Cloudflare Workers and R2 (fork of Nosflare)",
     "pubkey": "42d88cad5c336570e9ccfb8897781e09898110b048cb445787a6124a8540527d",
+    "icon": "https://ordrion.ordlify.com/icons/honostr.png",
     "contact": "iam@apo.mv",
     "supported_nips": [1, 2, 4, 5, 9, 11, 12, 15, 16, 17, 20, 22, 33, 40],
     "software": "https://github.com/afxal/honostr",
