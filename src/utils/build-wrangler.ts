@@ -14,6 +14,7 @@ interface EnvVars {
   COMPATIBILITY_DATE: string;
   AUTH_SECRET?: string;
   ENABLE_LOGGING?: string;
+  D1_DATABASE_ID: string;
 }
 
 const requiredEnvVars: (keyof EnvVars)[] = [
@@ -25,6 +26,7 @@ const requiredEnvVars: (keyof EnvVars)[] = [
   "R2_BUCKET_NAME",
   "COMPATIBILITY_DATE",
   "AUTH_SECRET",
+  "D1_DATABASE_ID",
 ];
 
 const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
@@ -65,8 +67,8 @@ account_id = "${ACCOUNT_ID}"
   };
 
   if (worker === "req") {
-    vars.API_TOKEN = "";
-    vars.ZONE_ID = "";
+    // vars.API_TOKEN = "";
+    // vars.ZONE_ID = "";
   }
 
   if (AUTH_SECRET) {
@@ -80,12 +82,40 @@ account_id = "${ACCOUNT_ID}"
   const varsSection = `
 [vars]
 ${varsEntries}
+WORKER_ENVIRONMENT = "development"
+
+[env.production.vars]
+WORKER_ENVIRONMENT = "production"
 `;
 
   const r2BucketConfig = `
 [[r2_buckets]]
 binding = "relayDb"
 bucket_name = "${R2_BUCKET_NAME}"
+`;
+
+  const kvNamespaceConfig = `
+[[kv_namespaces]]
+binding = "honostrKV"
+id = "${process.env.KV_NAMESPACE}"
+`;
+
+  const d1DatabaseConfig = `
+[[d1_databases]]
+binding = "DB"
+database_name = "honostr"
+database_id = "${process.env.D1_DATABASE_ID}"
+`;
+
+  const durableObjectConfig = `
+[durable_objects]
+bindings = [
+  { name = "RELAY_CACHE", class_name = "RelayCache" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RelayCache"]
 `;
 
   const loggingConfig = ENABLE_LOGGING
@@ -95,11 +125,39 @@ enabled = true
 `
     : "";
 
+  const eventServiceBindings =
+    worker === "relay"
+      ? `
+[[services]]
+binding = "EVENT_WORKER"
+service = "event-worker"
+
+[[services]]
+binding = "REQ_WORKER"
+service = "req-worker"
+`
+      : "";
+
+  const smartPlacement = `
+[placement]
+mode = "smart"
+`;
+
   const finalConfig = `${config.trim()}
 
 ${varsSection.trim()}
 
 ${r2BucketConfig.trim()}
+
+${kvNamespaceConfig.trim()}
+
+${d1DatabaseConfig.trim()}
+
+${worker == "relay" ? durableObjectConfig.trim() : ""}
+
+${eventServiceBindings.trim()}
+
+${smartPlacement.trim()}
 
 ${loggingConfig.trim()}
 `;

@@ -4,6 +4,10 @@ export interface Bindings {
   ZONE_ID: string;
   R2_BUCKET_DOMAIN: string;
   relayDb: R2Bucket;
+  honostrKV: KVNamespace;
+  DB: D1Database;
+  RELAY_CACHE: DurableObjectNamespace;
+  WORKER_ENVIRONMENT: string;
 }
 
 export interface Metadata {

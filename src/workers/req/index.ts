@@ -29,6 +29,48 @@ interface Filters {
   [key: string]: any; // Allows for additional dynamic filters
 }
 
+/**
+ * Parses a D1 database row into a NostrEvent object.
+ * @param row - The database row containing event data.
+ * @returns A NostrEvent object or null if parsing fails.
+ */
+function parseD1RowToEvent(row: any): NostrEvent | null {
+  try {
+    return {
+      id: row.id,
+      pubkey: row.pubkey,
+      created_at: row.created_at,
+      kind: row.kind,
+      tags: JSON.parse(row.tags as string),
+      content: row.content,
+      sig: row.sig,
+    } as NostrEvent;
+  } catch (error) {
+    console.error(`Error parsing event from D1:`, error);
+    return null;
+  }
+}
+
+/**
+ * Converts D1 query results into NostrEvents.
+ * @param results - The D1 query results.
+ * @param r2BucketDomain - The R2 bucket domain for fallback fetching.
+ * @returns Array of promises resolving to NostrEvent objects.
+ */
+function parseD1ResultsToEvents(
+  results: any[],
+  r2BucketDomain: string
+): Promise<NostrEvent | null>[] {
+  return results.map((row) => {
+    const event = parseD1RowToEvent(row);
+    if (event === null) {
+      // Fallback to R2 if parsing fails
+      return fetchEventById(row.id, r2BucketDomain);
+    }
+    return Promise.resolve(event);
+  });
+}
+
 // Initialize a new Hono application with custom bindings
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -131,23 +173,17 @@ async function processReq(
     if (filters.kinds) {
       console.log(`Fetching events by kinds: ${filters.kinds}`);
       // Fetch events by their kind/category
-      eventPromises.push(
-        ...(await fetchEventsByKind(filters.kinds, c.env.relayDb))
-      );
+      eventPromises.push(...(await fetchEventsByKind(filters.kinds, c)));
     }
     if (filters.authors) {
       console.log(`Fetching events by authors: ${filters.authors}`);
       // Fetch events by their authors' public keys
-      eventPromises.push(
-        ...(await fetchEventsByAuthor(filters.authors, c.env.relayDb))
-      );
+      eventPromises.push(...(await fetchEventsByAuthor(filters.authors, c)));
     }
     if (filters.tags) {
       console.log(`Fetching events by tags: ${JSON.stringify(filters.tags)}`);
       // Fetch events by specific tags
-      eventPromises.push(
-        ...(await fetchEventsByTag(filters.tags, c.env.relayDb))
-      );
+      eventPromises.push(...(await fetchEventsByTag(filters.tags, c)));
     }
 
     // Await all fetched events
@@ -201,21 +237,33 @@ async function fetchEventById(
 ): Promise<NostrEvent | null> {
   const idKey = `events/event:${id}`;
   const eventUrl = `https://${r2BucketDomain}/${idKey}`;
-  console.log(`Fetching event by ID: ${id} from ${eventUrl}`);
+
+  console.log(`Attempting to fetch from: ${eventUrl}`); // Debug URL
 
   try {
     return withConnectionLimit(async () => {
       const response = await fetch(eventUrl);
       if (!response.ok) {
-        console.warn(`Event not found for ID: ${id}`);
+        console.warn(
+          `Event not found for ID: ${id} (${response.status}) at ${eventUrl}`
+        );
         return null;
       }
       const data = await response.text();
-      console.log(`Event found for ID: ${id}`);
-      return JSON.parse(data) as NostrEvent;
+
+      try {
+        return JSON.parse(data) as NostrEvent;
+      } catch (parseError) {
+        console.error(`Error parsing event ${id}:`, parseError);
+        console.error("Raw data:", data);
+        return null;
+      }
     });
   } catch (error) {
-    console.error(`Error fetching event with ID ${id}:`, error);
+    console.error(
+      `Network error fetching event ${id} from ${eventUrl}:`,
+      error
+    );
     return null;
   }
 }
@@ -229,32 +277,37 @@ async function fetchEventById(
  */
 async function fetchEventsByKind(
   kinds: number[],
-  relayDb: R2Bucket,
+  c: Context<{ Bindings: Bindings }>,
   limit = 25
 ): Promise<Promise<NostrEvent | null>[]> {
   console.log(`Fetching events by kinds: ${kinds} with limit: ${limit}`);
 
   const promises: Promise<NostrEvent | null>[] = [];
-  for (const kind of kinds) {
-    const kindCountKey = `counts/kind_count_${kind}`;
-    console.log(`Fetching kind count for kind: ${kind}`);
+  try {
+    const stmt = c.env.DB.prepare(`
+      SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
+      FROM events 
+      WHERE kind IN (${kinds.join(",")})
+      AND (expires_at IS NULL OR expires_at > ?)
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `);
 
-    // Retrieve the current count of events for the specified kind
-    const kindCountResponse = await withConnectionLimit(() =>
-      relayDb.get(kindCountKey)
-    );
-    const kindCountValue = kindCountResponse
-      ? await kindCountResponse.text()
-      : "0";
-    const kindCount = parseInt(kindCountValue, 10);
-    console.log(`Found ${kindCount} events for kind: ${kind}`);
+    const now = Math.floor(Date.now() / 1000);
+    const results = await stmt.bind(now).all();
 
-    // Fetch the most recent 'limit' number of events for the specified kind
-    for (let i = kindCount; i >= Math.max(1, kindCount - limit + 1); i--) {
-      const kindKey = `kinds/kind-${kind}:${i}`;
-      promises.push(fetchEventByKey(kindKey, relayDb));
+    if (results.results && results.results.length > 0) {
+      console.log(
+        `Found ${results.results.length} events in D1 for kinds: ${kinds}`
+      );
+      promises.push(
+        ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
+      );
     }
+  } catch (error) {
+    console.error(`Error fetching from D1 for kinds ${kinds}:`, error);
   }
+
   return promises;
 }
 
@@ -267,32 +320,48 @@ async function fetchEventsByKind(
  */
 async function fetchEventsByAuthor(
   authors: string[],
-  relayDb: R2Bucket,
+  c: Context<{ Bindings: Bindings }>,
   limit = 25
 ): Promise<Promise<NostrEvent | null>[]> {
   console.log(`Fetching events by authors: ${authors} with limit: ${limit}`);
 
   const promises: Promise<NostrEvent | null>[] = [];
-  for (const author of authors) {
-    const pubkeyCountKey = `counts/pubkey_count_${author}`;
-    console.log(`Fetching pubkey count for author: ${author}`);
 
-    // Retrieve the current count of events for the specified author
-    const pubkeyCountResponse = await withConnectionLimit(() =>
-      relayDb.get(pubkeyCountKey)
-    );
-    const pubkeyCountValue = pubkeyCountResponse
-      ? await pubkeyCountResponse.text()
-      : "0";
-    const pubkeyCount = parseInt(pubkeyCountValue, 10);
-    console.log(`Found ${pubkeyCount} events for author: ${author}`);
+  let hasCachedPubkey = false;
+  try {
+    hasCachedPubkey = authors.some(async (author) => {
+      const cachedPubkey = await getFromKV(`cached/pubkey_${author}`, c);
+      return cachedPubkey !== null;
+    });
+  } catch (error) {}
 
-    // Fetch the most recent 'limit' number of events for the specified author
-    for (let i = pubkeyCount; i >= Math.max(1, pubkeyCount - limit + 1); i--) {
-      const pubkeyKey = `pubkeys/pubkey-${author}:${i}`;
-      promises.push(fetchEventByKey(pubkeyKey, relayDb));
+  const limitQuery = !hasCachedPubkey ? `LIMIT ${limit}` : ``;
+
+  try {
+    const stmt = c.env.DB.prepare(`
+      SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
+      FROM events 
+      WHERE pubkey IN (${authors.map((a) => `'${a}'`).join(",")})
+      AND (expires_at IS NULL OR expires_at > ?)
+      ORDER BY created_at DESC
+      ${limitQuery}
+    `);
+
+    const now = Math.floor(Date.now() / 1000);
+    const results = await stmt.bind(now).all();
+
+    if (results.results && results.results.length > 0) {
+      console.log(
+        `Found ${results.results.length} events in D1 for authors: ${authors}`
+      );
+      promises.push(
+        ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
+      );
     }
+  } catch (error) {
+    console.error(`Error fetching from D1 for authors ${authors}:`, error);
   }
+
   return promises;
 }
 
@@ -305,7 +374,7 @@ async function fetchEventsByAuthor(
  */
 async function fetchEventsByTag(
   tags: [string, string][],
-  relayDb: R2Bucket,
+  c: Context<{ Bindings: Bindings }>,
   limit = 25
 ): Promise<Promise<NostrEvent | null>[]> {
   console.log(
@@ -313,57 +382,33 @@ async function fetchEventsByTag(
   );
 
   const promises: Promise<NostrEvent | null>[] = [];
-  for (const [tagName, tagValue] of tags) {
-    const tagCountKey = `counts/${tagName}_count_${tagValue}`;
-    console.log(`Fetching tag count for tag: ${tagName}-${tagValue}`);
+  try {
+    for (const [tagName, tagValue] of tags) {
+      const stmt = c.env.DB.prepare(`
+        SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
+        FROM events
+        WHERE json_array_contains(tags, json_array(?, ?))
+        AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `);
 
-    // Retrieve the current count of events for the specified tag
-    const tagCountResponse = await withConnectionLimit(() =>
-      relayDb.get(tagCountKey)
-    );
-    const tagCountValue = tagCountResponse
-      ? await tagCountResponse.text()
-      : "0";
-    const tagCount = parseInt(tagCountValue, 10);
-    console.log(`Found ${tagCount} events for tag: ${tagName}-${tagValue}`);
+      const now = Math.floor(Date.now() / 1000);
+      const results = await stmt.bind(tagName, tagValue, now).all();
 
-    // Fetch the most recent 'limit' number of events for the specified tag
-    for (let i = tagCount; i >= Math.max(1, tagCount - limit + 1); i--) {
-      const tagKey = `tags/${tagName}-${tagValue}:${i}`;
-      promises.push(fetchEventByKey(tagKey, relayDb));
+      if (results.results && results.results.length > 0) {
+        console.log(
+          `Found ${results.results.length} events in D1 for tag: ${tagName}-${tagValue}`
+        );
+        promises.push(
+          ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
+        );
+      }
     }
+  } catch (error) {
+    console.error(`Error fetching from D1 for tags:`, error);
   }
   return promises;
-}
-
-/**
- * Fetches an event by its specific key from the R2 bucket.
- * This is a common utility function used by various fetch functions.
- * @param eventKey - The R2 key corresponding to the event.
- * @param relayDb - The R2 bucket instance for database operations.
- * @returns A promise resolving to a NostrEvent object or null if not found.
- */
-async function fetchEventByKey(
-  eventKey: string,
-  relayDb: R2Bucket
-): Promise<NostrEvent | null> {
-  console.log(`Fetching event by key: ${eventKey}`);
-
-  try {
-    return withConnectionLimit(async () => {
-      const object = await relayDb.get(eventKey);
-      if (!object) {
-        console.warn(`Event not found for key: ${eventKey}`);
-        return null;
-      }
-      const data = await object.text();
-      console.log(`Event found for key: ${eventKey}`);
-      return JSON.parse(data) as NostrEvent;
-    });
-  } catch (error) {
-    console.error(`Error fetching event with key ${eventKey}:`, error);
-    return null;
-  }
 }
 
 /**
@@ -401,6 +446,13 @@ function filterEvents(events: NostrEvent[], filters: Filters): NostrEvent[] {
 
     return includeEvent;
   });
+}
+
+async function getFromKV(
+  key: string,
+  c: Context<{ Bindings: Bindings }>
+): Promise<string | null> {
+  return await c.env.honostrKV.get(key);
 }
 
 // Export the Hono application as the default export

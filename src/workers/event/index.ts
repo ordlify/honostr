@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { Context } from "hono";
 import { Bindings, Metadata } from "./bindings";
+import { initializeD1Database } from "./migration";
 
 // Interface defining the structure of a Nostr event
 interface NostrEvent {
@@ -16,33 +17,43 @@ interface NostrEvent {
 // Initialize a new Hono application with custom bindings
 const app = new Hono<{ Bindings: Bindings }>();
 
-// Maximum number of concurrent connections allowed
-const MAX_CONCURRENT_CONNECTIONS = 6;
-let activeConnections = 0;
+// Initialize database when the worker starts
+app.use("*", async (c, next) => {
+  if (c.env.WORKER_ENVIRONMENT === "development") {
+    console.log("Initializing database for development...");
+    const dbInit = await initializeD1Database(c.env);
+    if (!dbInit.success) {
+      console.error("Failed to initialize database:", dbInit.error);
+    }
+  }
+  await next();
+});
 
-/**
- * Controls the number of active connections to prevent overloading.
- * Implements a semaphore-like mechanism to limit concurrency.
- * @param promiseFunction - The asynchronous function to execute.
- * @returns The resolved value of the provided promiseFunction.
- */
-async function withConnectionLimit<T>(
+// Update the connection limits
+const MAX_R2_WRITES_PER_SECOND = 40;
+const MAX_CONCURRENT_CONNECTIONS = 40; // Increased from 6
+let activeWriteOperations = 0;
+
+// Separate limiters for reads and writes
+async function withWriteLimit<T>(
   promiseFunction: () => Promise<T>
 ): Promise<T> {
-  // Wait if the number of active connections has reached the maximum limit
-  while (activeConnections >= MAX_CONCURRENT_CONNECTIONS) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  while (activeWriteOperations >= MAX_R2_WRITES_PER_SECOND) {
+    await new Promise((resolve) => setTimeout(resolve, 20)); // Reduced wait time
   }
-
-  // Increment the count of active connections
-  activeConnections += 1;
+  activeWriteOperations += 1;
   try {
-    // Execute the provided asynchronous function
     return await promiseFunction();
   } finally {
-    // Decrement the count after the function has completed
-    activeConnections -= 1;
+    activeWriteOperations -= 1;
   }
+}
+
+// Remove connection limit for reads
+async function withReadOperation<T>(
+  promiseFunction: () => Promise<T>
+): Promise<T> {
+  return promiseFunction();
 }
 
 // Flag to enable or disable global duplicate hash checks
@@ -92,7 +103,9 @@ app.post("/", async (c: Context<{ Bindings: Bindings }>) => {
   try {
     // Retrieve the Authorization header from the request
     const authHeader = c.req.header("Authorization");
-    console.log(`Authorization header received: ${authHeader !== null}`);
+
+    const cacheEvent = c.req.header("Cache-Event") ? true : false;
+    console.log(`Cache-Event header received: ${cacheEvent}`);
 
     // Validate the Authorization header against the expected AUTH_TOKEN
     if (!authHeader || authHeader !== `Bearer ${c.env.AUTH_TOKEN}`) {
@@ -107,7 +120,7 @@ app.post("/", async (c: Context<{ Bindings: Bindings }>) => {
     // Handle different types of messages; currently only "EVENT" is supported
     if (type === "EVENT") {
       console.log(`Processing event with ID: ${event.id}`);
-      const result = await processEvent(event, c);
+      const result = await processEvent(event, cacheEvent, c.env);
       if (result.success) {
         return c.text("Event received successfully", 200);
       } else {
@@ -131,7 +144,8 @@ app.post("/", async (c: Context<{ Bindings: Bindings }>) => {
  */
 async function processEvent(
   event: NostrEvent,
-  c: Context<{ Bindings: Bindings }>
+  cacheEvent: boolean,
+  c: Bindings
 ): Promise<{ success: boolean; error?: string }> {
   try {
     // Check if the event is a deletion event (kind 5)
@@ -143,11 +157,21 @@ async function processEvent(
 
     console.log(`Saving event with ID: ${event.id} to R2...`);
     // Attempt to save the event to the R2 bucket
-    const saveResult = await saveEventToR2(event, c);
+    const saveResult = await saveEventToR2(event, cacheEvent, c);
 
     if (!saveResult.success) {
-      console.error(`Failed to save event with ID: ${event.id}`);
+      console.error(
+        `Failed to save event with ID: ${event.id}`,
+        saveResult.error
+      );
       return { success: false, error: saveResult.error };
+    }
+
+    // if cacheEvent is true, send the event to the relay worker
+    const d1Result = await saveEventToD1(event, cacheEvent, c);
+    if (!d1Result.success) {
+      console.error(`Failed to save event with ID: ${event.id} to D1`);
+      return { success: false, error: d1Result.error };
     }
 
     console.log(`Event with ID: ${event.id} processed successfully.`);
@@ -169,242 +193,94 @@ async function processEvent(
  */
 async function saveEventToR2(
   event: NostrEvent,
-  c: Context<{ Bindings: Bindings }>
+  cacheEvent: boolean,
+  c: Bindings
 ): Promise<{ success: boolean; error?: string }> {
-  // Add expiration handling near the start of the function
-  let customMetadata = {};
-  const expirationTag = event.tags.find((tag) => tag[0] === "expiration");
-
-  if (expirationTag && expirationTag[1]) {
-    const expirationTimestamp = parseInt(expirationTag[1], 10);
-    if (!isNaN(expirationTimestamp)) {
-      // Convert UNIX timestamp to HTTP date format for R2
-      const expirationDate = new Date(expirationTimestamp * 1000);
-      customMetadata = {
-        httpMetadata: {
-          expires: expirationDate.toUTCString(),
-        },
-      };
-    }
-  }
-
-  // Define keys for storing the event and its metadata in R2
   const eventKey = `events/event:${event.id}`;
-  const metadataKey = `metadata/event:${event.id}`;
-  console.log(`Generating content hash for event with ID: ${event.id}`);
 
-  // Generate a hash of the event content to detect duplicates
-  const contentHash = await hashContent(event);
-  const contentHashKey = enableGlobalDuplicateCheck
-    ? `hashes/${contentHash}`
-    : `hashes/${event.pubkey}:${contentHash}`;
+  try {
+    // Handle expiration
+    let r2Options: R2PutOptions = {};
+    const expirationTag = event.tags.find((tag) => tag[0] === "expiration");
 
-  // Determine if the event kind should bypass duplicate hash checks
-  if (isDuplicateBypassed(event.kind)) {
-    console.log(`Skipping duplicate check for kind: ${event.kind}`);
-  } else {
-    // Attempt to retrieve an existing hash to detect duplicates
-    try {
-      console.log(
-        `Checking for existing content hash for event ID: ${event.id}`
-      );
-      const existingHash = await withConnectionLimit(() =>
-        c.env.relayDb.get(contentHashKey)
-      );
-      if (existingHash) {
-        console.log(
-          `Duplicate content detected for event: ${JSON.stringify(
-            event
-          )}. Event dropped.`
-        );
-        return {
-          success: false,
-          error: `Duplicate content detected for event with content: ${event.content}`,
+    if (expirationTag?.[1]) {
+      // Simplified check
+      const expirationTimestamp = parseInt(expirationTag[1], 10);
+      if (!isNaN(expirationTimestamp)) {
+        r2Options.httpMetadata = {
+          cacheExpiry: new Date(expirationTimestamp * 1000),
         };
       }
-    } catch (error) {
-      // If the error is not due to the hash not existing, log it
-      if (
-        (error as any).name !== "R2Error" ||
-        (error as any).message !== "R2 object not found"
-      ) {
-        console.error(
-          `Error checking content hash in R2: ${(error as Error).message}`
-        );
-        return {
-          success: false,
-          error: `Error checking content hash in R2: ${
-            (error as Error).message
-          }`,
-        };
-      }
-      // If the hash does not exist, proceed to save the event
     }
-  }
 
-  // Check if the event ID already exists to prevent duplicates
-  try {
-    console.log(`Checking for existing event ID: ${event.id}`);
-    const existingEvent = await withConnectionLimit(() =>
-      c.env.relayDb.get(eventKey)
-    );
-    if (existingEvent) {
-      console.log(`Duplicate event: ${event.id}. Event dropped.`);
-      return { success: false, error: "Duplicate event" };
-    }
-  } catch (error) {
-    // If the error is not due to the event not existing, log it
-    if (
-      (error as any).name !== "R2Error" ||
-      (error as any).message !== "R2 object not found"
-    ) {
-      console.error(
-        `Error checking duplicate event in R2: ${(error as Error).message}`
-      );
-      return {
-        success: false,
-        error: `Error checking duplicate event in R2: ${
-          (error as Error).message
-        }`,
-      };
-    }
-    // If the event does not exist, proceed to save it
-  }
-
-  // Fetch current counts for the event's kind and pubkey to index the event
-  let kindCount: number, pubkeyCount: number;
-  try {
-    const kindCountKey = `counts/kind_count_${event.kind}`;
-    const pubkeyCountKey = `counts/pubkey_count_${event.pubkey}`;
-    console.log(
-      `Fetching counts for kind: ${event.kind} and pubkey: ${event.pubkey}`
-    );
-
-    kindCount = await getCount(kindCountKey, c);
-    pubkeyCount = await getCount(pubkeyCountKey, c);
-  } catch (error) {
-    console.error(
-      `Error fetching counts for kind or pubkey: ${(error as Error).message}`
-    );
-    return {
-      success: false,
-      error: `Error fetching counts: ${(error as Error).message}`,
+    r2Options.customMetadata = {
+      id: event.id,
+      kindKey: `kinds/kind_${event.kind}`,
+      pubkeyKey: `pubkeys/pubkey_${event.pubkey}`,
+      contentHashKey: "",
     };
-  }
 
-  // Define keys for indexing the event by kind and pubkey
-  const kindKey = `kinds/kind-${event.kind}:${kindCount + 1}`;
-  const pubkeyKey = `pubkeys/pubkey-${event.pubkey}:${pubkeyCount + 1}`;
+    // Only check for duplicates if not a cache event
+    if (!cacheEvent) {
+      // Fast check for existing event using head
+      const existingEvent = await withReadOperation(() =>
+        c.relayDb.head(eventKey)
+      ).catch(() => null);
 
-  // Create a metadata object to track related keys
-  const metadata = {
-    kindKey,
-    pubkeyKey,
-    tags: [] as string[],
-    contentHashKey,
-  };
+      if (existingEvent) {
+        return { success: false, error: "Duplicate event" };
+      }
 
-  // Reference the event with count-based keys
-  const eventWithCountRef = { ...event, kindKey, pubkeyKey };
+      // Content hash check only if needed
+      if (!isDuplicateBypassed(event.kind)) {
+        const contentHash = await hashContent(event);
+        const contentHashKey = enableGlobalDuplicateCheck
+          ? `hashes/${contentHash}`
+          : `hashes/${event.pubkey}:${contentHash}`;
 
-  // Handle tags in batches to optimize storage operations
-  const tagBatches: Promise<void>[] = [];
-  let currentBatch: Promise<void>[] = [];
+        const existingHash = await withReadOperation(() =>
+          c.relayDb.head(contentHashKey)
+        ).catch(() => null);
 
-  try {
-    console.log(`Processing and saving tags for event ID: ${event.id}`);
-    for (const tag of event.tags) {
-      const [tagName, tagValue] = tag;
-      if (tagName && tagValue) {
-        const tagKey = `tags/${tagName}-${tagValue}:${kindCount + 1}`;
-        metadata.tags.push(tagKey);
-        currentBatch.push(
-          withConnectionLimit(async () => {
-            await c.env.relayDb.put(tagKey, JSON.stringify(event));
-          })
-        );
-
-        // If the current batch reaches 5 tags, add it to the tagBatches array
-        if (currentBatch.length === 5) {
-          tagBatches.push(Promise.all(currentBatch).then(() => {}));
-          currentBatch = [];
+        if (existingHash) {
+          return { success: false, error: "Duplicate content detected" };
         }
+
+        r2Options.customMetadata = {
+          ...r2Options.customMetadata,
+          contentHashKey,
+        };
+
+        // Save content hash if needed
+        await withWriteLimit(() =>
+          c.relayDb.put(contentHashKey, JSON.stringify(event), r2Options)
+        );
       }
     }
 
-    // Add any remaining tags in the current batch to tagBatches
-    if (currentBatch.length > 0) {
-      tagBatches.push(Promise.all(currentBatch).then(() => {}));
-    }
-  } catch (error) {
-    console.error(
-      `Error processing tags for event ID: ${event.id}: ${
-        (error as Error).message
-      }`
+    // Save event with metadata
+    await withWriteLimit(() =>
+      c.relayDb.put(eventKey, JSON.stringify(event), r2Options)
     );
-    return {
-      success: false,
-      error: `Error processing tags: ${(error as Error).message}`,
-    };
-  }
 
-  try {
-    console.log(`Saving event and related data for event ID: ${event.id}`);
-    // Save the event and its related data (kind, pubkey, counts, metadata) to R2
-    await Promise.all([
-      withConnectionLimit(() =>
-        c.env.relayDb.put(kindKey, JSON.stringify(event), { customMetadata })
-      ),
-      withConnectionLimit(() =>
-        c.env.relayDb.put(pubkeyKey, JSON.stringify(event), { customMetadata })
-      ),
-      withConnectionLimit(() =>
-        c.env.relayDb.put(eventKey, JSON.stringify(eventWithCountRef), {
-          customMetadata,
-        })
-      ),
-      withConnectionLimit(() =>
-        c.env.relayDb.put(
-          `counts/kind_count_${event.kind}`,
-          (kindCount + 1).toString()
-        )
-      ),
-      withConnectionLimit(() =>
-        c.env.relayDb.put(
-          `counts/pubkey_count_${event.pubkey}`,
-          (pubkeyCount + 1).toString()
-        )
-      ),
-      withConnectionLimit(() =>
-        c.env.relayDb.put(metadataKey, JSON.stringify(metadata), {
-          customMetadata,
-        })
-      ),
-    ]);
-
-    // Execute all tag batches to save tag data
-    for (const batch of tagBatches) {
-      await batch;
+    // Handle first event caching if needed
+    if (cacheEvent) {
+      queueMicrotask(async () => {
+        try {
+          const pubkeyCountKey = `pubkey_count_${event.pubkey}`;
+          const pubkeyCount = await getCount(pubkeyCountKey, c);
+          if (pubkeyCount + 1 === 1) {
+            await saveToKV(`cached/pubkey_${event.pubkey}`, event.id, c);
+          }
+        } catch (error) {
+          console.error("First event caching error:", error);
+        }
+      });
     }
 
-    // Save the content hash to R2 if duplicate checks are enabled for this kind
-    if (!isDuplicateBypassed(event.kind)) {
-      console.log(`Saving content hash for event ID: ${event.id}`);
-      await withConnectionLimit(() =>
-        c.env.relayDb.put(contentHashKey, JSON.stringify(event), {
-          customMetadata,
-        })
-      );
-    }
-
-    console.log(`Event ${event.id} saved successfully.`);
     return { success: true };
   } catch (error) {
-    console.error(
-      `Error saving event data in R2 for event ID: ${event.id}: ${
-        (error as Error).message
-      }`
-    );
+    console.error(`R2 error: ${(error as Error).message}`);
     return {
       success: false,
       error: `Error saving event data: ${(error as Error).message}`,
@@ -412,23 +288,96 @@ async function saveEventToR2(
   }
 }
 
-/**
- * Retrieves the current count for a given key from R2.
- * If the key does not exist, returns 0.
- * @param key - The R2 key to retrieve the count from.
- * @param c - The Hono context containing bindings.
- * @returns The current count as a number.
- */
-async function getCount(
-  key: string,
-  c: Context<{ Bindings: Bindings }>
-): Promise<number> {
+async function saveToKV(key: string, value: string, c: Bindings) {
+  await c.honostrKV.put(key, value);
+}
+
+async function saveEventToD1(
+  event: NostrEvent,
+  cacheEvent: boolean,
+  c: Bindings
+): Promise<{ success: boolean; error?: string }> {
   try {
-    console.log(`Retrieving count for key: ${key}`);
-    const response = await withConnectionLimit(() => c.env.relayDb.get(key));
-    const value = response ? await response.text() : "0";
-    const count = parseInt(value, 10);
-    return isNaN(count) ? 0 : count;
+    console.log(`Saving event with ID: ${event.id} to D1...`);
+
+    // Handle expiration
+    let expires_at: number | null = null;
+    const expirationTag = event.tags.find((tag) => tag[0] === "expiration");
+    if (expirationTag && expirationTag[1]) {
+      const expirationTimestamp = parseInt(expirationTag[1], 10);
+      if (!isNaN(expirationTimestamp)) {
+        expires_at = expirationTimestamp;
+      }
+    }
+
+    // Insert the event
+    const insertEventStmt = c.DB.prepare(`
+      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING;
+    `);
+
+    const insertMetadataStmt = c.DB.prepare(`
+      INSERT INTO metadata (event_id, pubkey, created_at, kind, tags, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_id) DO NOTHING;
+    `);
+
+    const eventKindCountStmt = c.DB.prepare(`
+      INSERT INTO counts (key, count) VALUES (?, 1)
+      ON CONFLICT(key) DO UPDATE SET count = count + 1
+    `);
+
+    const eventPubkeyCountStmt = c.DB.prepare(`
+      INSERT INTO counts (key, count) VALUES (?, 1)
+      ON CONFLICT(key) DO UPDATE SET count = count + 1
+    `);
+
+    const executeResult = await c.DB.batch([
+      insertEventStmt.bind(
+        event.id,
+        event.pubkey,
+        event.created_at,
+        event.kind,
+        JSON.stringify(event.tags),
+        event.content,
+        event.sig,
+        expires_at
+      ),
+      insertMetadataStmt.bind(
+        event.id,
+        event.pubkey,
+        event.created_at,
+        event.kind,
+        JSON.stringify(event.tags),
+        expires_at
+      ),
+      eventKindCountStmt.bind(`kind_count_${event.kind}`),
+      eventPubkeyCountStmt.bind(`pubkey_count_${event.pubkey}`),
+    ]);
+
+    if (executeResult) {
+      console.log(`Event with ID: ${event.id} saved to D1 successfully.`);
+      return { success: true };
+    }
+
+    return { success: false, error: "Failed to save event to D1" };
+  } catch (error) {
+    console.error(`Error saving event to D1: ${(error as Error).message}`);
+    return {
+      success: false,
+      error: `Error saving to D1: ${(error as Error).message}`,
+    };
+  }
+}
+
+async function getCount(key: string, c: Bindings): Promise<number> {
+  try {
+    const stmt = c.DB.prepare(`SELECT count FROM counts WHERE key = ?`);
+    const result: { key: string; count: number } | null = await stmt
+      .bind(key)
+      .first();
+    return result ? result.count : 0;
   } catch (error) {
     console.error(
       `Error retrieving count for key ${key}: ${(error as Error).message}`
@@ -444,62 +393,59 @@ async function getCount(
  * @param deletionEvent - The deletion event containing tags with event IDs to delete.
  * @param c - The Hono context containing bindings.
  */
-async function processDeletionEvent(
-  deletionEvent: NostrEvent,
-  c: Context<{ Bindings: Bindings }>
-) {
-  console.log(`Processing deletion event with ID: ${deletionEvent.id}`);
-  // Extract event IDs to delete from the deletion event's tags
+async function processDeletionEvent(deletionEvent: NostrEvent, c: Bindings) {
+  console.log(`Processing deletion event: ${deletionEvent.id}`);
   const deletedEventIds = deletionEvent.tags
     .filter((tag) => tag[0] === "e")
     .map((tag) => tag[1]);
 
-  // Iterate over each event ID to perform deletion
   for (const eventId of deletedEventIds) {
-    const metadataKey = `metadata/event:${eventId}`;
+    const eventKey = `events/event:${eventId}`;
     try {
       console.log(`Attempting to delete event with ID: ${eventId}`);
-      // Retrieve the metadata associated with the event
-      const metadataResponse = await withConnectionLimit(() =>
-        c.env.relayDb.get(metadataKey)
+      // Use read operation for getting metadata
+      const eventObject = await withReadOperation(() =>
+        c.relayDb.head(eventKey)
       );
 
-      if (metadataResponse) {
-        const metadata: Metadata = await metadataResponse.json();
+      const customMetadata: Record<string, string> | undefined =
+        eventObject?.customMetadata;
 
-        // Compile all related keys that need to be deleted
-        const keysToDelete = [
-          `events/event:${eventId}`, // Event content
-          metadata.kindKey, // Kind reference
-          metadata.pubkeyKey, // Pubkey reference
-          metadata.contentHashKey, // Content hash reference
-          ...metadata.tags, // Associated tags
-        ];
+      if (customMetadata) {
+        const contentHashKey = customMetadata.contentHashKey
+          ? customMetadata.contentHashKey
+          : undefined;
 
-        // Delete all related keys concurrently
+        const keysToDelete = [eventKey];
+
+        if (contentHashKey) {
+          keysToDelete.push(contentHashKey);
+        }
+
+        // Delete R2 objects in parallel with write limits
         await Promise.all(
-          keysToDelete.map((key) =>
-            withConnectionLimit(() => c.env.relayDb.delete(key))
-          )
+          keysToDelete.map((key) => withWriteLimit(() => c.relayDb.delete(key)))
         );
 
-        // Also delete the metadata key itself
-        await withConnectionLimit(() => c.env.relayDb.delete(metadataKey));
+        // Delete from D1 in parallel
+        await Promise.all([
+          c.DB.prepare(`DELETE FROM events WHERE id = ?`).bind(eventId).run(),
+          c.DB.prepare(`DELETE FROM metadata WHERE event_id = ?`)
+            .bind(eventId)
+            .run(),
+        ]);
 
-        // Purge the deleted keys from the Cloudflare cache
-        await purgeCloudflareCache(keysToDelete, c);
+        // Purge cache without waiting
+        purgeCloudflareCache(keysToDelete, c).catch((error) =>
+          console.error("Cache purge error:", error)
+        );
 
-        console.log(`Event ${eventId} and its metadata deleted successfully.`);
+        console.log(`Deleted event: ${eventId}`);
       } else {
-        // Log a warning if the event is not found
         console.warn(`Event with ID: ${eventId} not found. Nothing to delete.`);
       }
     } catch (error) {
-      console.error(
-        `Error processing deletion for event ${eventId}: ${
-          (error as Error).message
-        }`
-      );
+      console.error(`Deletion error ${eventId}: ${(error as Error).message}`);
     }
   }
 }
@@ -509,16 +455,12 @@ async function processDeletionEvent(
  * @param keys - The R2 keys corresponding to the events to purge.
  * @param c - The Hono context containing bindings.
  */
-async function purgeCloudflareCache(
-  keys: string[],
-  c: Context<{ Bindings: Bindings }>
-) {
+async function purgeCloudflareCache(keys: string[], c: Bindings) {
   const headers = new Headers();
-  headers.append("Authorization", `Bearer ${c.env.API_TOKEN}`);
+  headers.append("Authorization", `Bearer ${c.API_TOKEN}`);
   headers.append("Content-Type", "application/json");
 
-  // Construct full URLs for the keys without encoding `/` and `:`
-  const urls = keys.map((key) => `https://${c.env.R2_BUCKET_DOMAIN}/${key}`);
+  const urls = keys.map((key) => `https://${c.R2_BUCKET_DOMAIN}/${key}`);
 
   const requestOptions = {
     method: "POST",
@@ -526,19 +468,19 @@ async function purgeCloudflareCache(
     body: JSON.stringify({ files: urls }),
   };
 
-  return withConnectionLimit(async () => {
-    console.log(`Purging Cloudflare cache for URLs: ${urls}`);
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${c.env.ZONE_ID}/purge_cache`,
-      requestOptions
-    );
-    if (response.ok) {
-      response.body?.cancel(); // Cancel the response body to free up resources
-    } else {
-      throw new Error(`Failed to purge Cloudflare cache: ${response.status}`);
-    }
-    console.log(`Cloudflare cache purged for URLs:`, urls);
-  });
+  // No need for connection limit here as it's an external API call
+  console.log(`Purging Cloudflare cache for URLs: ${urls}`);
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${c.ZONE_ID}/purge_cache`,
+    requestOptions
+  );
+
+  if (!response.ok) {
+    throw new Error(`Failed to purge Cloudflare cache: ${response.status}`);
+  }
+
+  response.body?.cancel(); // Cancel the response body to free up resources
+  console.log(`Cache purged for ${keys.length} keys`);
 }
 
 /**
@@ -565,7 +507,6 @@ async function hashContent(event: NostrEvent): Promise<string> {
   const buffer = new TextEncoder().encode(contentToHash);
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
   const hash = bytesToHex(new Uint8Array(hashBuffer));
-  console.log(`Generated hash for event ID: ${event.id}: ${hash}`);
   return hash;
 }
 
@@ -579,6 +520,5 @@ function bytesToHex(bytes: Uint8Array): string {
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 }
-
 // Export the Hono application as the default export
 export default app;

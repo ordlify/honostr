@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "@noble/curves": "^1.0.0",
-    "hono": "^4.6.12"
+    "hono": "^4.6.12",
+    "lru-cache": "^11.0.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241112.0",

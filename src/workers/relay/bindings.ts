@@ -4,6 +4,11 @@ export interface Bindings {
   ZONE_ID: string;
   R2_BUCKET_DOMAIN: string;
   relayDb: R2Bucket;
+  honostrKV: KVNamespace;
+  DB: D1Database;
+  RELAY_CACHE: DurableObjectNamespace;
+  EVENT_WORKER: Fetcher;
+  REQ_WORKER: Fetcher;
 }
 
 export type NostrEvent = {
@@ -24,6 +29,13 @@ export type Filters = {
   until?: number;
   limit?: number;
   [key: string]: any;
+};
+
+export type RequestMetadata = {
+  captchaToken: string | null;
+  authToken: string | null;
+  cached: boolean;
+  isAdmin: boolean;
 };
 
 export interface RelayConfig {
