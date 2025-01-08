@@ -98,6 +98,73 @@ function isDuplicateBypassed(kind: number): boolean {
   return bypassDuplicateKinds.has(kind);
 }
 
+/**
+ * Verifies the proof of work for an event according to NIP-13.
+ * @param event - The Nostr event to verify.
+ * @returns True if PoW is valid or not required, false otherwise.
+ */
+async function verifyProofOfWork(event: NostrEvent): Promise<boolean> {
+  // Find nonce tag
+  const nonceTag = event.tags.find((tag) => tag[0] === "nonce");
+  if (!nonceTag || !nonceTag[1]) {
+    return true; // No nonce tag, assume PoW not required
+  }
+
+  // Require difficulty to be specified in the nonce tag
+  if (!nonceTag[2]) {
+    console.warn(`Event ${event.id} has nonce but no difficulty specified`);
+    return false;
+  }
+
+  const nonce = nonceTag[1];
+  const difficulty = parseInt(nonceTag[2], 10);
+
+  if (isNaN(difficulty)) {
+    console.warn(
+      `Event ${event.id} has invalid difficulty value: ${nonceTag[2]}`
+    );
+    return false;
+  }
+
+  // Create a copy of the event tags without the nonce tag
+  const tagsWithoutNonce = event.tags.filter((tag) => tag[0] !== "nonce");
+
+  // Add the nonce tag at the end (important for hash calculation)
+  const tagsWithNonce = [...tagsWithoutNonce, ["nonce", nonce]];
+
+  // Create the string to hash (including nonce in tags)
+  const serializedEvent = JSON.stringify([
+    0,
+    event.pubkey,
+    event.created_at,
+    event.kind,
+    tagsWithNonce,
+    event.content,
+  ]);
+
+  // Calculate the hash
+  const buffer = new TextEncoder().encode(serializedEvent);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  const hash = bytesToHex(new Uint8Array(hashBuffer));
+
+  // Count leading zero bits
+  let leadingZeros = 0;
+  for (const char of hash) {
+    const nibble = parseInt(char, 16);
+    if (nibble === 0) {
+      leadingZeros += 4;
+    } else {
+      leadingZeros += Math.clz32(nibble) - 28;
+      break;
+    }
+  }
+
+  console.log(
+    `PoW verification - Event: ${event.id}, Difficulty: ${difficulty}, Leading Zeros: ${leadingZeros}, Hash: ${hash}`
+  );
+  return leadingZeros >= difficulty;
+}
+
 // Define the POST route to handle incoming Nostr events
 app.post("/", async (c: Context<{ Bindings: Bindings }>) => {
   try {
@@ -148,11 +215,15 @@ async function processEvent(
   c: Bindings
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    // Verify proof of work first
+    if (!(await verifyProofOfWork(event))) {
+      return { success: false, error: "Invalid proof of work" };
+    }
+
     // Check if the event is a deletion event (kind 5)
     if (event.kind === 5) {
       console.log(`Processing deletion event for event ID: ${event.id}`);
       await processDeletionEvent(event, c);
-      return { success: true };
     }
 
     console.log(`Saving event with ID: ${event.id} to R2...`);
@@ -403,6 +474,27 @@ async function processDeletionEvent(deletionEvent: NostrEvent, c: Bindings) {
     const eventKey = `events/event:${eventId}`;
     try {
       console.log(`Attempting to delete event with ID: ${eventId}`);
+
+      // First, fetch the event to check ownership
+      const existingEvent = await c.DB.prepare(
+        `
+        SELECT pubkey FROM events WHERE id = ?
+      `
+      )
+        .bind(eventId)
+        .first<{ pubkey: string }>();
+
+      // Skip if event doesn't exist
+      if (!existingEvent) {
+        console.warn(`Event with ID: ${eventId} not found. Nothing to delete.`);
+        continue;
+      }
+
+      // Verify the deletion request is from the event owner
+      if (existingEvent.pubkey !== deletionEvent.pubkey) {
+        throw new Error("Unauthorized deletion request");
+      }
+
       // Use read operation for getting metadata
       const eventObject = await withReadOperation(() =>
         c.relayDb.head(eventKey)
@@ -441,11 +533,9 @@ async function processDeletionEvent(deletionEvent: NostrEvent, c: Bindings) {
         );
 
         console.log(`Deleted event: ${eventId}`);
-      } else {
-        console.warn(`Event with ID: ${eventId} not found. Nothing to delete.`);
       }
     } catch (error) {
-      console.error(`Deletion error ${eventId}: ${(error as Error).message}`);
+      throw new Error(`Deletion error ${eventId}: ${(error as Error).message}`);
     }
   }
 }
