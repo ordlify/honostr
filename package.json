@@ -6,18 +6,22 @@
     "build:relay": "esbuild src/workers/relay/index.ts --bundle --outfile=dist/relay-worker.js --platform=neutral --target=es2020 --format=esm",
     "build:event": "esbuild src/workers/event/index.ts --bundle --outfile=dist/event-worker.js --platform=neutral --target=es2020 --format=esm",
     "build:req": "esbuild src/workers/req/index.ts --bundle --outfile=dist/req-worker.js --platform=neutral --target=es2020 --format=esm",
+    "build:publish": "esbuild src/workers/publish/index.ts --bundle --outfile=dist/publish-worker.js --platform=neutral --target=es2020 --format=esm",
     "build:wrangler": "ts-node src/utils/build-wrangler.ts",
     "dev:relay": "$npm_execpath build:wrangler && $npm_execpath build:relay && cd src/workers/relay && wrangler dev",
     "dev:event": "$npm_execpath build:wrangler && $npm_execpath build:event && cd src/workers/event && wrangler dev",
     "dev:req": "$npm_execpath build:wrangler && $npm_execpath build:req && cd src/workers/req && wrangler dev",
+    "dev:publish": "$npm_execpath build:wrangler && $npm_execpath build:publish && cd src/workers/publish && wrangler dev",
     "deploy:relay": "$npm_execpath build:wrangler && $npm_execpath build:relay && cd src/workers/relay && wrangler publish --minify",
     "deploy:event": "$npm_execpath build:wrangler && $npm_execpath build:event && cd src/workers/event && wrangler publish --minify",
+    "deploy:publish": "$npm_execpath build:wrangler && $npm_execpath build:publish && cd src/workers/publish && wrangler publish --minify",
     "deploy:req": "$npm_execpath build:wrangler && $npm_execpath build:req && cd src/workers/req && wrangler publish --minify"
   },
   "dependencies": {
     "@noble/curves": "^1.0.0",
     "hono": "^4.6.12",
-    "lru-cache": "^11.0.2"
+    "lru-cache": "^11.0.2",
+    "nostr-tools": "^2.10.4"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241112.0",
