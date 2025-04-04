@@ -30,7 +30,7 @@ app.post("/publish-event", async (c) => {
   const signedEvent = finalizeEvent(eventData, hexToBytes(secKey));
 
   try {
-    const response: any = await publishEvent(signedEvent);
+    const response: any = await publishEvent(signedEvent, c.env.AUTH_TOKEN);
     if (isSuccessfulResponse(response)) {
       console.log(response, "response");
       return c.json({ eventId: signedEvent.id, success: true });
@@ -43,10 +43,10 @@ app.post("/publish-event", async (c) => {
   }
 });
 
-async function publishEvent(eventData: any) {
+async function publishEvent(eventData: any, authToken: string) {
   console.log("Publishing event:", eventData);
   return new Promise((resolve, reject) => {
-    const urlWithParams = `wss://nostr.ovia.to`;
+    const urlWithParams = `wss://nostr.ovia.to?cached=true&authToken=${authToken}`;
 
     const ws: WebSocket = new WebSocket(urlWithParams);
 
