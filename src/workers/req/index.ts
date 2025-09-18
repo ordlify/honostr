@@ -25,8 +25,7 @@ interface Filters {
   since?: number; // Unix timestamp to filter events created after this time
   until?: number; // Unix timestamp to filter events created before this time
   limit?: number; // Maximum number of events to return
-  tags?: [string, string][]; // Array of tag filters, each as a tuple [tagName, tagValue]
-  [key: string]: any; // Allows for additional dynamic filters
+  [key: string]: any; // Allows for additional dynamic filters including tag filters like #p, #e, etc.
 }
 
 /**
@@ -163,6 +162,7 @@ async function processReq(
 
   // Attempt to fetch events based on different types of filters
   try {
+    // First handle ID-based queries separately (they don't need DB)
     if (filters.ids) {
       console.log(`Fetching events by IDs: ${filters.ids}`);
       // Fetch events by their unique IDs in batches
@@ -170,26 +170,38 @@ async function processReq(
         ...fetchEventsById(filters.ids, c.env.R2_BUCKET_DOMAIN)
       );
     }
-    if (filters.kinds) {
-      console.log(`Fetching events by kinds: ${filters.kinds}`);
-      // Fetch events by their kind/category
-      eventPromises.push(...(await fetchEventsByKind(filters.kinds, c)));
+
+    // Check for tag filters in the format #<tagname> (e.g., #p, #e)
+    const tagFilters: [string, string[]][] = [];
+    for (const [key, value] of Object.entries(filters)) {
+      if (key.startsWith('#') && Array.isArray(value)) {
+        const tagName = key.slice(1); // Remove the # prefix
+        tagFilters.push([tagName, value]);
+      }
     }
-    if (filters.authors) {
-      console.log(`Fetching events by authors: ${filters.authors}`);
-      // Fetch events by their authors' public keys
-      eventPromises.push(...(await fetchEventsByAuthor(filters.authors, c)));
-    }
-    if (filters.tags) {
-      console.log(`Fetching events by tags: ${JSON.stringify(filters.tags)}`);
-      // Fetch events by specific tags
-      eventPromises.push(...(await fetchEventsByTag(filters.tags, c)));
+
+    // If we have any combination of kinds, authors, or tags, use a combined query
+    const hasKinds = filters.kinds && filters.kinds.length > 0;
+    const hasAuthors = filters.authors && filters.authors.length > 0;
+    const hasTags = tagFilters.length > 0;
+
+    if (hasKinds || hasAuthors || hasTags) {
+      console.log(`Fetching events with combined filters: kinds=${hasKinds}, authors=${hasAuthors}, tags=${hasTags}`);
+      eventPromises.push(
+        ...(await fetchEventsByCombinedFilters(
+          filters.kinds || [],
+          filters.authors || [],
+          tagFilters,
+          c,
+          filters.limit
+        ))
+      );
     }
 
     // Await all fetched events
     const fetchedEvents = await Promise.all(eventPromises);
     console.log(`Fetched ${fetchedEvents.length} events, applying filters...`);
-    // Filter the fetched events based on additional criteria
+    // Filter the fetched events based on additional criteria (since, until, etc.)
     events = filterEvents(
       fetchedEvents.filter((event): event is NostrEvent => event !== null),
       filters
@@ -268,146 +280,119 @@ async function fetchEventById(
   }
 }
 
+
 /**
- * Fetches events by their kind/category in batches.
- * @param kinds - An array of event kinds to fetch.
- * @param relayDb - The R2 bucket instance for database operations.
- * @param limit - The maximum number of events to fetch per kind.
- * @returns An array of promises resolving to NostrEvent objects or null if not found.
+ * Fetches events using combined filters for efficiency.
+ * @param kinds - Array of event kinds to filter.
+ * @param authors - Array of author public keys to filter.
+ * @param tagFilters - Array of tag filters [tagName, tagValues[]].
+ * @param c - The Hono context containing bindings.
+ * @param limit - The maximum number of events to fetch.
+ * @returns An array of promises resolving to NostrEvent objects.
  */
-async function fetchEventsByKind(
+async function fetchEventsByCombinedFilters(
   kinds: number[],
-  c: Context<{ Bindings: Bindings }>,
-  limit = 25
-): Promise<Promise<NostrEvent | null>[]> {
-  console.log(`Fetching events by kinds: ${kinds} with limit: ${limit}`);
-
-  const promises: Promise<NostrEvent | null>[] = [];
-  try {
-    const stmt = c.env.DB.prepare(`
-      SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
-      FROM events 
-      WHERE kind IN (${kinds.join(",")})
-      AND (expires_at IS NULL OR expires_at > ?)
-      ORDER BY created_at DESC
-      LIMIT ${limit}
-    `);
-
-    const now = Math.floor(Date.now() / 1000);
-    const results = await stmt.bind(now).all();
-
-    if (results.results && results.results.length > 0) {
-      console.log(
-        `Found ${results.results.length} events in D1 for kinds: ${kinds}`
-      );
-      promises.push(
-        ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
-      );
-    }
-  } catch (error) {
-    console.error(`Error fetching from D1 for kinds ${kinds}:`, error);
-  }
-
-  return promises;
-}
-
-/**
- * Fetches events by their authors' public keys in batches.
- * @param authors - An array of author public keys to fetch events for.
- * @param relayDb - The R2 bucket instance for database operations.
- * @param limit - The maximum number of events to fetch per author.
- * @returns An array of promises resolving to NostrEvent objects or null if not found.
- */
-async function fetchEventsByAuthor(
   authors: string[],
+  tagFilters: [string, string[]][],
   c: Context<{ Bindings: Bindings }>,
-  limit = 25
+  limit?: number
 ): Promise<Promise<NostrEvent | null>[]> {
-  console.log(`Fetching events by authors: ${authors} with limit: ${limit}`);
-
   const promises: Promise<NostrEvent | null>[] = [];
-
-  let hasCachedPubkey = false;
-  try {
-    hasCachedPubkey = authors.some(async (author) => {
-      const cachedPubkey = await getFromKV(`cached/pubkey_${author}`, c);
-      return cachedPubkey !== null;
-    });
-  } catch (error) {}
-
-  const limitQuery = !hasCachedPubkey ? `LIMIT ${limit}` : ``;
+  const effectiveLimit = limit || 25;
 
   try {
-    const stmt = c.env.DB.prepare(`
-      SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
-      FROM events 
-      WHERE pubkey IN (${authors.map((a) => `'${a}'`).join(",")})
-      AND (expires_at IS NULL OR expires_at > ?)
-      ORDER BY created_at DESC
-      ${limitQuery}
-    `);
+    // For tags, we need to handle them specially
+    // If there are tag filters, we'll need to do separate queries for each tag combination
+    if (tagFilters.length > 0) {
+      // For simplicity, let's query for each tag value combination
+      for (const [tagName, tagValues] of tagFilters) {
+        for (const tagValue of tagValues) {
+          // D1/SQLite JSON query - check if the tags JSON contains our target tag
+          // Using json_each to iterate through the array and check each tag
+          let query = `
+            SELECT DISTINCT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, e.expires_at
+            FROM events e, json_each(e.tags) AS tag
+            WHERE json_extract(tag.value, '$[0]') = ?
+              AND json_extract(tag.value, '$[1]') = ?
+          `;
 
-    const now = Math.floor(Date.now() / 1000);
-    const results = await stmt.bind(now).all();
+          const queryParams: any[] = [tagName, tagValue];
 
-    if (results.results && results.results.length > 0) {
-      console.log(
-        `Found ${results.results.length} events in D1 for authors: ${authors}`
-      );
-      promises.push(
-        ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
-      );
-    }
-  } catch (error) {
-    console.error(`Error fetching from D1 for authors ${authors}:`, error);
-  }
+          // Add other conditions if present
+          if (kinds.length > 0) {
+            query += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+            queryParams.push(...kinds);
+          }
+          if (authors.length > 0) {
+            query += ` AND pubkey IN (${authors.map(() => '?').join(',')})`;
+            queryParams.push(...authors);
+          }
 
-  return promises;
-}
+          query += `
+            AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY created_at DESC
+            LIMIT ${effectiveLimit}
+          `;
 
-/**
- * Fetches events by specific tags in batches.
- * @param tags - An array of tag tuples [tagName, tagValue] to filter events.
- * @param relayDb - The R2 bucket instance for database operations.
- * @param limit - The maximum number of events to fetch per tag.
- * @returns An array of promises resolving to NostrEvent objects or null if not found.
- */
-async function fetchEventsByTag(
-  tags: [string, string][],
-  c: Context<{ Bindings: Bindings }>,
-  limit = 25
-): Promise<Promise<NostrEvent | null>[]> {
-  console.log(
-    `Fetching events by tags: ${JSON.stringify(tags)} with limit: ${limit}`
-  );
+          const now = Math.floor(Date.now() / 1000);
+          queryParams.push(now);
 
-  const promises: Promise<NostrEvent | null>[] = [];
-  try {
-    for (const [tagName, tagValue] of tags) {
-      const stmt = c.env.DB.prepare(`
-        SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
-        FROM events
-        WHERE json_array_contains(tags, json_array(?, ?))
-        AND (expires_at IS NULL OR expires_at > ?)
-        ORDER BY created_at DESC
-        LIMIT ${limit}
-      `);
+          const stmt = c.env.DB.prepare(query);
+          const results = await stmt.bind(...queryParams).all();
 
-      const now = Math.floor(Date.now() / 1000);
-      const results = await stmt.bind(tagName, tagValue, now).all();
+          if (results.results && results.results.length > 0) {
+            console.log(`Found ${results.results.length} events for combined query with tag ${tagName}:${tagValue}`);
+            promises.push(
+              ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
+            );
+          }
+        }
+      }
+    } else {
+      // No tag filters, just kinds and/or authors
+      const conditions: string[] = [];
+      const queryParams: any[] = [];
 
-      if (results.results && results.results.length > 0) {
-        console.log(
-          `Found ${results.results.length} events in D1 for tag: ${tagName}-${tagValue}`
-        );
-        promises.push(
-          ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
-        );
+      // Add kinds condition
+      if (kinds.length > 0) {
+        conditions.push(`kind IN (${kinds.map(() => '?').join(',')})`);
+        queryParams.push(...kinds);
+      }
+
+      // Add authors condition
+      if (authors.length > 0) {
+        conditions.push(`pubkey IN (${authors.map(() => '?').join(',')})`);
+        queryParams.push(...authors);
+      }
+
+      if (conditions.length > 0) {
+        const query = `
+          SELECT id, pubkey, created_at, kind, tags, content, sig, expires_at
+          FROM events
+          WHERE ${conditions.join(' AND ')}
+          AND (expires_at IS NULL OR expires_at > ?)
+          ORDER BY created_at DESC
+          LIMIT ${effectiveLimit}
+        `;
+
+        const now = Math.floor(Date.now() / 1000);
+        queryParams.push(now);
+
+        const stmt = c.env.DB.prepare(query);
+        const results = await stmt.bind(...queryParams).all();
+
+        if (results.results && results.results.length > 0) {
+          console.log(`Found ${results.results.length} events for combined query`);
+          promises.push(
+            ...parseD1ResultsToEvents(results.results, c.env.R2_BUCKET_DOMAIN)
+          );
+        }
       }
     }
   } catch (error) {
-    console.error(`Error fetching from D1 for tags:`, error);
+    console.error(`Error fetching from D1 with combined filters:`, error);
   }
+
   return promises;
 }
 
@@ -430,15 +415,19 @@ function filterEvents(events: NostrEvent[], filters: Filters): NostrEvent[] {
       (!filters.since || event.created_at >= filters.since) &&
       (!filters.until || event.created_at <= filters.until);
 
-    // Check for tag filters
-    if (filters.tags) {
-      for (const [tagName, tagValue] of filters.tags) {
+    // Check for tag filters in NIP-01 format (#p, #e, etc.)
+    for (const [key, values] of Object.entries(filters)) {
+      if (key.startsWith('#') && Array.isArray(values)) {
+        const tagName = key.slice(1); // Remove the # prefix
         // Extract the values of the specified tag from the event's tags
-        const eventTags = event.tags
+        const eventTagValues = event.tags
           .filter(([t]) => t === tagName)
           .map(([, v]) => v);
-        // If the event does not contain the required tag value, exclude it
-        if (!eventTags.includes(tagValue)) {
+        // Check if at least one of the filter values matches the event's tag values
+        const hasMatch = values.some((filterValue: string) =>
+          eventTagValues.includes(filterValue)
+        );
+        if (!hasMatch) {
           return false;
         }
       }
